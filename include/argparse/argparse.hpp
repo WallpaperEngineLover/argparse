@@ -895,6 +895,14 @@ public:
     return nargs(nargs_pattern::any);
   }
 
+  // Like remaining(), but without forcing nargs to "any" - for a fixed-arity argument (e.g. a
+  // single "X,Y" value) whose value can itself start with a prefix char (e.g. a negative X), so it
+  // isn't mistaken for the start of another option and truncated to "too few arguments".
+  Argument &allow_optional_like_value() {
+    m_accepts_optional_like_value = true;
+    return *this;
+  }
+
   template <typename T> void add_choice(T &&choice) {
     static_assert(details::IsChoiceTypeSupported<T>::value,
                   "Only string or integer type supported for choice");
