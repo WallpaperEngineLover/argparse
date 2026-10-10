@@ -58,6 +58,18 @@ SOFTWARE.
 #include <variant>
 #include <vector>
 #include <filesystem>
+#if defined(__has_include)
+#  if __has_include(<format>)
+#    include <format>
+#  endif
+#endif
+#endif
+
+// std::format support requires C++20 and a standard library that actually
+// defines std::formatter (merely finding the <format> header isn't enough,
+// since e.g. libc++ ships the header even in C++17 mode with no contents).
+#if defined(__cpp_lib_format)
+#  define ARGPARSE_HAS_STD_FORMAT 1
 #endif
 
 #ifndef ARGPARSE_CUSTOM_STRTOF
@@ -576,6 +588,32 @@ std::string get_most_similar_string(const std::map<std::string, ValueType> &map,
   return most_similar;
 }
 
+// RAII guard: forces space-fill and left-justification for help/usage
+// rendering, restoring the stream's original flags/fill on scope exit (even
+// if a write throws), so printing doesn't leak into or inherit from the
+// caller's stream state.
+class StreamFormatGuard {
+public:
+  explicit StreamFormatGuard(std::ostream &stream)
+      : m_stream(stream), m_flags(stream.flags()), m_fill(stream.fill()) {
+    m_stream.setf(std::ios_base::left, std::ios_base::adjustfield);
+    m_stream.fill(' ');
+  }
+
+  StreamFormatGuard(const StreamFormatGuard &) = delete;
+  StreamFormatGuard &operator=(const StreamFormatGuard &) = delete;
+
+  ~StreamFormatGuard() {
+    m_stream.flags(m_flags);
+    m_stream.fill(m_fill);
+  }
+
+private:
+  std::ostream &m_stream;
+  std::ios_base::fmtflags m_flags;
+  char m_fill;
+};
+
 } // namespace details
 
 enum class nargs_pattern { optional, any, at_least_one };
@@ -984,13 +1022,20 @@ public:
   /* The dry_run parameter can be set to true to avoid running the actions,
    * and setting m_is_used. This may be used by a pre-processing step to do
    * a first iteration over arguments.
+   *
+   * The force_positional parameter indicates that the values in [start, end)
+   * appeared after a "--" separator, and so must be treated as positional
+   * values even if they look like optional arguments, e.g., "-5" or "--foo".
    */
   template <typename Iterator>
   Iterator consume(Iterator start, Iterator end,
-                   std::string_view used_name = {}, bool dry_run = false) {
-    if (!m_is_repeatable && m_is_used) {
-      throw std::runtime_error(
-          std::string("Duplicate argument ").append(used_name));
+                   std::string_view used_name = {}, bool dry_run = false,
+                   bool force_positional = false) {
+    if (!m_is_repeatable && m_is_used && !dry_run) {
+      // Re-specifying a non-repeatable argument replaces its previous
+      // value(s) instead of erroring, matching most CLI parsers' "last
+      // occurrence wins" convention.
+      m_values.clear();
     }
     m_used_name = used_name;
 
@@ -1039,7 +1084,7 @@ public:
         end = std::next(start, static_cast<typename Iterator::difference_type>(
                                    num_args_max));
       }
-      if (!m_accepts_optional_like_value) {
+      if (!m_accepts_optional_like_value && !force_positional) {
         end = std::find_if(
             start, end,
             std::bind(is_optional, std::placeholders::_1, m_prefix_chars));
@@ -1193,6 +1238,8 @@ public:
 
   friend std::ostream &operator<<(std::ostream &stream,
                                   const Argument &argument) {
+    details::StreamFormatGuard format_guard(stream);
+
     std::stringstream name_stream;
     name_stream << "  "; // indent
     if (argument.is_positional(argument.m_names.front(),
@@ -1293,6 +1340,11 @@ public:
                         });
     }
   }
+
+  // Whether this argument was supplied on the command line.
+  bool is_used() const { return m_is_used; }
+
+  explicit operator bool() const { return is_used(); }
 
   /*
    * positional:
@@ -1854,47 +1906,7 @@ public:
    */
   void parse_args(const std::vector<std::string> &arguments) {
     parse_args_internal(arguments);
-    // Check if all arguments are parsed
-    for ([[maybe_unused]] const auto &[unused, argument] : m_argument_map) {
-      argument->validate();
-    }
-
-    // Check each mutually exclusive group and make sure
-    // there are no constraint violations
-    for (const auto &group : m_mutually_exclusive_groups) {
-      auto mutex_argument_used{false};
-      Argument *mutex_argument_it{nullptr};
-      for (Argument *arg : group.m_elements) {
-        if (!mutex_argument_used && arg->m_is_used) {
-          mutex_argument_used = true;
-          mutex_argument_it = arg;
-        } else if (mutex_argument_used && arg->m_is_used) {
-          // Violation
-          throw std::runtime_error("Argument '" + arg->get_usage_full() +
-                                   "' not allowed with '" +
-                                   mutex_argument_it->get_usage_full() + "'");
-        }
-      }
-
-      if (!mutex_argument_used && group.m_required) {
-        // at least one argument from the group is
-        // required
-        std::string argument_names{};
-        std::size_t i = 0;
-        std::size_t size = group.m_elements.size();
-        for (Argument *arg : group.m_elements) {
-          if (i + 1 == size) {
-            // last
-            argument_names += std::string("'") + arg->get_usage_full() + std::string("' ");
-          } else {
-            argument_names += std::string("'") + arg->get_usage_full() + std::string("' or ");
-          }
-          i += 1;
-        }
-        throw std::runtime_error("One of the arguments " + argument_names +
-                                 "is required");
-      }
-    }
+    validate_parsed_arguments();
   }
 
   /* Call parse_known_args_internal - which does all the work
@@ -1905,10 +1917,7 @@ public:
   std::vector<std::string>
   parse_known_args(const std::vector<std::string> &arguments) {
     auto unknown_arguments = parse_known_args_internal(arguments);
-    // Check if all arguments are parsed
-    for ([[maybe_unused]] const auto &[unused, argument] : m_argument_map) {
-      argument->validate();
-    }
+    validate_parsed_arguments();
     return unknown_arguments;
   }
 
@@ -1957,7 +1966,7 @@ public:
    * user-supplied, even with a default value.
    */
   auto is_used(std::string_view arg_name) const {
-    return (*this)[arg_name].m_is_used;
+    return (*this)[arg_name].is_used();
   }
 
   /* Getter that returns true if a subcommand is used.
@@ -2005,7 +2014,7 @@ public:
   // Print help message
   friend auto operator<<(std::ostream &stream, const ArgumentParser &parser)
       -> std::ostream & {
-    stream.setf(std::ios_base::left);
+    details::StreamFormatGuard format_guard(stream);
 
     auto longest_arg_length = parser.get_length_of_longest_argument();
 
@@ -2273,6 +2282,50 @@ public:
   void set_suppress(bool suppress) { m_suppress = suppress; }
 
 protected:
+  void validate_parsed_arguments() const {
+    // Check if all arguments are parsed
+    for ([[maybe_unused]] const auto &[unused, argument] : m_argument_map) {
+      argument->validate();
+    }
+
+    // Check each mutually exclusive group and make sure
+    // there are no constraint violations
+    for (const auto &group : m_mutually_exclusive_groups) {
+      auto mutex_argument_used{false};
+      Argument *mutex_argument_it{nullptr};
+      for (Argument *arg : group.m_elements) {
+        if (!mutex_argument_used && arg->m_is_used) {
+          mutex_argument_used = true;
+          mutex_argument_it = arg;
+        } else if (mutex_argument_used && arg->m_is_used) {
+          // Violation
+          throw std::runtime_error("Argument '" + arg->get_usage_full() +
+                                   "' not allowed with '" +
+                                   mutex_argument_it->get_usage_full() + "'");
+        }
+      }
+
+      if (!mutex_argument_used && group.m_required) {
+        // at least one argument from the group is
+        // required
+        std::string argument_names{};
+        std::size_t i = 0;
+        std::size_t size = group.m_elements.size();
+        for (Argument *arg : group.m_elements) {
+          if (i + 1 == size) {
+            // last
+            argument_names += std::string("'") + arg->get_usage_full() + std::string("' ");
+          } else {
+            argument_names += std::string("'") + arg->get_usage_full() + std::string("' or ");
+          }
+          i += 1;
+        }
+        throw std::runtime_error("One of the arguments " + argument_names +
+                                 "is required");
+      }
+    }
+  }
+
   const MutuallyExclusiveGroup *get_belonging_mutex(const Argument *arg) const {
     for (const auto &mutex : m_mutually_exclusive_groups) {
       if (std::find(mutex.m_elements.begin(), mutex.m_elements.end(), arg) !=
@@ -2293,8 +2346,14 @@ protected:
    * Pre-process this argument list. Anything starting with "--", that
    * contains an =, where the prefix before the = has an entry in the
    * options table, should be split.
+   *
+   * Also detects a lone "--" pseudo-argument (when '-' is a legal prefix
+   * char and no argument is explicitly named "--"): everything from that
+   * point on is forced to be treated as positional, and the "--" itself is
+   * removed from the returned list. The returned index marks the position,
+   * in the returned argument list, where forced-positional parsing begins.
    */
-  std::vector<std::string>
+  std::pair<std::vector<std::string>, std::optional<std::size_t>>
   preprocess_arguments(const std::vector<std::string> &raw_arguments) const {
     std::vector<std::string> arguments{};
     for (const auto &arg : raw_arguments) {
@@ -2351,22 +2410,45 @@ protected:
       // If we've fallen through to here, then it's a standard argument
       arguments.push_back(arg);
     }
-    return arguments;
+
+    // Detect a lone "--" separator: everything after it is forced to be
+    // parsed as positional, mirroring Python's argparse behaviour. Only
+    // applies when '-' is a legal prefix char and "--" isn't itself the
+    // name of a defined argument.
+    std::optional<std::size_t> separator_index;
+    if (m_prefix_chars.find('-') != std::string::npos &&
+        m_argument_map.find("--") == m_argument_map.end()) {
+      auto separator_it = std::find(arguments.begin(), arguments.end(), "--");
+      if (separator_it != arguments.end()) {
+        separator_index = static_cast<std::size_t>(
+            std::distance(arguments.begin(), separator_it));
+        arguments.erase(separator_it);
+      }
+    }
+
+    return {arguments, separator_index};
   }
 
   /*
    * @throws std::runtime_error in case of any invalid argument
    */
   void parse_args_internal(const std::vector<std::string> &raw_arguments) {
-    auto arguments = preprocess_arguments(raw_arguments);
+    auto [arguments, separator_index] = preprocess_arguments(raw_arguments);
     if (m_program_name.empty() && !arguments.empty()) {
       m_program_name = arguments.front();
     }
     auto end = std::end(arguments);
     auto positional_argument_it = std::begin(m_positional_arguments);
-    for (auto it = std::next(std::begin(arguments)); it != end;) {
+    for (auto it = arguments.empty() ? std::begin(arguments)
+                                     : std::next(std::begin(arguments));
+         it != end;) {
       const auto &current_argument = *it;
-      if (Argument::is_positional(current_argument, m_prefix_chars)) {
+      const bool force_positional =
+          separator_index.has_value() &&
+          static_cast<std::size_t>(std::distance(std::begin(arguments), it)) >=
+              *separator_index;
+      if (force_positional ||
+          Argument::is_positional(current_argument, m_prefix_chars)) {
         if (positional_argument_it == std::end(m_positional_arguments)) {
 
           // Check sub-parsers
@@ -2430,14 +2512,15 @@ protected:
             positional_argument_it->m_num_args_range.get_min() == 1 &&
             positional_argument_it->m_num_args_range.get_max() == 1 ) {
           if (std::next(it) != end) {
-            positional_argument_it->consume(std::prev(end), end);
+            positional_argument_it->consume(std::prev(end), end, {}, false,
+                                            force_positional);
             end = std::prev(end);
           } else {
             throw std::runtime_error("Missing " + positional_argument_it->m_names.front());
           }
         }
 
-        it = argument->consume(it, end);
+        it = argument->consume(it, end, {}, false, force_positional);
         continue;
       }
 
@@ -2451,7 +2534,7 @@ protected:
                  !is_valid_prefix_char(compound_arg[1])) {
         ++it;
         for (std::size_t j = 1; j < compound_arg.size(); j++) {
-          auto hypothetical_arg = std::string{'-', compound_arg[j]};
+          auto hypothetical_arg = std::string{compound_arg[0], compound_arg[j]};
           auto arg_map_it2 = m_argument_map.find(hypothetical_arg);
           if (arg_map_it2 != m_argument_map.end()) {
             auto argument = arg_map_it2->second;
@@ -2472,7 +2555,7 @@ protected:
    */
   std::vector<std::string>
   parse_known_args_internal(const std::vector<std::string> &raw_arguments) {
-    auto arguments = preprocess_arguments(raw_arguments);
+    auto [arguments, separator_index] = preprocess_arguments(raw_arguments);
 
     std::vector<std::string> unknown_arguments{};
 
@@ -2481,9 +2564,16 @@ protected:
     }
     auto end = std::end(arguments);
     auto positional_argument_it = std::begin(m_positional_arguments);
-    for (auto it = std::next(std::begin(arguments)); it != end;) {
+    for (auto it = arguments.empty() ? std::begin(arguments)
+                                     : std::next(std::begin(arguments));
+         it != end;) {
       const auto &current_argument = *it;
-      if (Argument::is_positional(current_argument, m_prefix_chars)) {
+      const bool force_positional =
+          separator_index.has_value() &&
+          static_cast<std::size_t>(std::distance(std::begin(arguments), it)) >=
+              *separator_index;
+      if (force_positional ||
+          Argument::is_positional(current_argument, m_prefix_chars)) {
         if (positional_argument_it == std::end(m_positional_arguments)) {
 
           // Check sub-parsers
@@ -2497,8 +2587,13 @@ protected:
             // invoke subparser
             m_is_parsed = true;
             m_subparser_used[current_argument] = true;
-            return subparser_it->second->get().parse_known_args_internal(
-                unprocessed_arguments);
+            auto subparser_unknown_arguments =
+                subparser_it->second->get().parse_known_args_internal(
+                    unprocessed_arguments);
+            unknown_arguments.insert(unknown_arguments.end(),
+                                     subparser_unknown_arguments.begin(),
+                                     subparser_unknown_arguments.end());
+            return unknown_arguments;
           }
 
           // save current argument as unknown and go to next argument
@@ -2508,7 +2603,7 @@ protected:
           // current argument is the value of a positional argument
           // consume it
           auto argument = positional_argument_it++;
-          it = argument->consume(it, end);
+          it = argument->consume(it, end, {}, false, force_positional);
         }
         continue;
       }
@@ -2523,7 +2618,7 @@ protected:
                  !is_valid_prefix_char(compound_arg[1])) {
         ++it;
         for (std::size_t j = 1; j < compound_arg.size(); j++) {
-          auto hypothetical_arg = std::string{'-', compound_arg[j]};
+          auto hypothetical_arg = std::string{compound_arg[0], compound_arg[j]};
           auto arg_map_it2 = m_argument_map.find(hypothetical_arg);
           if (arg_map_it2 != m_argument_map.end()) {
             auto argument = arg_map_it2->second;
@@ -2595,3 +2690,28 @@ protected:
 };
 
 } // namespace argparse
+
+#ifdef ARGPARSE_HAS_STD_FORMAT
+// Formats via the existing operator<<, so std::format/std::print work the
+// same way as writing to an ostream.
+template <>
+struct std::formatter<argparse::Argument> : std::formatter<std::string> {
+  auto format(const argparse::Argument &argument,
+              std::format_context &ctx) const {
+    std::ostringstream stream;
+    stream << argument;
+    return std::formatter<std::string>::format(stream.str(), ctx);
+  }
+};
+
+template <>
+struct std::formatter<argparse::ArgumentParser>
+   : std::formatter<std::string> {
+  auto format(const argparse::ArgumentParser &parser,
+              std::format_context &ctx) const {
+    std::ostringstream stream;
+    stream << parser;
+    return std::formatter<std::string>::format(stream.str(), ctx);
+  }
+};
+#endif

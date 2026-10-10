@@ -36,6 +36,7 @@
      *    [Converting to Numeric Types](#converting-to-numeric-types)
      *    [Default Arguments](#default-arguments)
      *    [Gathering Remaining Arguments](#gathering-remaining-arguments)
+     *    [The -- separator](#the----separator)
      *    [Parent Parsers](#parent-parsers)
      *    [Subcommands](#subcommands)
      *    [Getting Argument and Subparser Instances](#getting-argument-and-subparser-instances)
@@ -245,7 +246,24 @@ auto color = program.get<std::string>("--color");  // "orange"
 auto explicit_color = program.is_used("--color");  // true, user provided orange
 ```
 
+If you already have a reference to the `Argument` (e.g., saved from `add_argument`), you can call `.is_used()` on it directly, instead of looking it up again by name:
+
+```cpp
+auto &color_arg = program.add_argument("--color")
+  .default_value(std::string{"orange"})
+  .help("specify the cat's fur color");
+
+program.parse_args(argc, argv);
+
+auto explicit_color = color_arg.is_used();  // true, user provided a value
+if (color_arg) {                            // Argument also has an explicit operator bool()
+  // ...
+}
+```
+
 #### Joining values of repeated optional arguments
+
+By default, repeating an optional argument on the command line simply replaces its previous value with the last one provided, e.g., `./main --foo 1 --foo 2` results in `--foo` being `2`. This matches the "last occurrence wins" behavior of most CLI parsers. If you instead want to gather every provided value, use `.append()`:
 
 You may want to allow an optional argument to be repeated and gather all values in one place.
 
@@ -453,6 +471,15 @@ Optional arguments:
 ```
 
 You may also get the help message in string via `program.help().str()`.
+
+If your compiler and standard library support `std::format`/`std::print` (C++20), `argparse::ArgumentParser` and `argparse::Argument` are also formattable directly, producing the same output as `operator<<`:
+
+```cpp
+std::print("{}", program); // same as std::cout << program
+auto message = std::format("{}", program);
+```
+
+This is detected automatically at compile time; no extra include or opt-in is required beyond `<format>` being available.
 
 #### Adding a description and an epilog to help
 
@@ -792,6 +819,31 @@ baz.cpp
 -o
 main
 ```
+
+### The -- separator
+
+Like Python's `argparse`, a lone `--` on the command line marks the end of optional arguments: everything after it is treated as positional, even if it looks like an optional argument (e.g., starts with `-`). The `--` itself is consumed and does not appear in any parsed values.
+
+```cpp
+argparse::ArgumentParser program("compiler");
+
+program.add_argument("files")
+  .remaining();
+
+program.parse_args(argc, argv);
+
+auto files = program.get<std::vector<std::string>>("files");
+for (auto& file : files)
+  std::cout << file << std::endl;
+```
+
+```console
+foo@bar:/home/dev/$ ./compiler -- --foo.cpp -bar.cpp
+--foo.cpp
+-bar.cpp
+```
+
+This makes it unnecessary to work around option-like positional values with a dummy mutually exclusive `--` argument.
 
 ### Parent Parsers
 
